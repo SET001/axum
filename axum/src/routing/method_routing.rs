@@ -808,7 +808,7 @@ where
         T::Response: IntoResponse + 'static,
         T::Future: Send + 'static,
     {
-        self.fallback = Fallback::Custom(Route::new(svc));
+        self.fallback = Fallback::Service(Route::new(svc));
         self
     }
 
@@ -818,7 +818,7 @@ where
         T::Response: IntoResponse + 'static,
         T::Future: Send + 'static,
     {
-        self.fallback = Fallback::Custom(Route::new(svc));
+        self.fallback = Fallback::Service(Route::new(svc));
         self
     }
 
@@ -930,9 +930,9 @@ where
         ) -> Fallback<B, E> {
             match (fallback, fallback_other) {
                 (pick @ Fallback::Default(_), Fallback::Default(_)) => pick,
-                (Fallback::Default(_), pick @ Fallback::Custom(_)) => pick,
-                (pick @ Fallback::Custom(_), Fallback::Default(_)) => pick,
-                (Fallback::Custom(_), Fallback::Custom(_)) => {
+                (Fallback::Default(_), pick @ Fallback::Service(_)) => pick,
+                (pick @ Fallback::Service(_), Fallback::Default(_)) => pick,
+                (Fallback::Service(_), Fallback::Service(_)) => {
                     panic!("Cannot merge two `MethodRouter`s that both have a fallback")
                 }
             }
@@ -1289,7 +1289,7 @@ where
         let future = match fallback {
             Fallback::Default(fallback) => RouteFuture::from_future(fallback.oneshot_inner(req))
                 .strip_body(method == Method::HEAD),
-            Fallback::Custom(fallback) => RouteFuture::from_future(fallback.oneshot_inner(req))
+            Fallback::Service(fallback) => RouteFuture::from_future(fallback.oneshot_inner(req))
                 .strip_body(method == Method::HEAD),
         };
 

@@ -325,9 +325,9 @@ where
 
         self.fallback = match (self.fallback, fallback) {
             (Fallback::Default(_), pick @ Fallback::Default(_)) => pick,
-            (Fallback::Default(_), pick @ Fallback::Custom(_)) => pick,
-            (pick @ Fallback::Custom(_), Fallback::Default(_)) => pick,
-            (Fallback::Custom(_), Fallback::Custom(_)) => {
+            (Fallback::Default(_), pick @ Fallback::Service(_)) => pick,
+            (pick @ Fallback::Service(_), Fallback::Default(_)) => pick,
+            (Fallback::Service(_), Fallback::Service(_)) => {
                 panic!("Cannot merge two `Router`s that both have a fallback")
             }
         };
@@ -438,7 +438,7 @@ where
         T::Response: IntoResponse,
         T::Future: Send + 'static,
     {
-        self.fallback = Fallback::Custom(Route::new(svc));
+        self.fallback = Fallback::Service(Route::new(svc));
         self
     }
 
@@ -530,14 +530,14 @@ impl fmt::Debug for Node {
 
 enum Fallback<B, E = Infallible> {
     Default(Route<B, E>),
-    Custom(Route<B, E>),
+    Service(Route<B, E>),
 }
 
 impl<B, E> Clone for Fallback<B, E> {
     fn clone(&self) -> Self {
         match self {
             Fallback::Default(inner) => Fallback::Default(inner.clone()),
-            Fallback::Custom(inner) => Fallback::Custom(inner.clone()),
+            Fallback::Service(inner) => Fallback::Service(inner.clone()),
         }
     }
 }
@@ -546,7 +546,7 @@ impl<B, E> fmt::Debug for Fallback<B, E> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Default(inner) => f.debug_tuple("Default").field(inner).finish(),
-            Self::Custom(inner) => f.debug_tuple("Custom").field(inner).finish(),
+            Self::Service(inner) => f.debug_tuple("Service").field(inner).finish(),
         }
     }
 }
@@ -558,7 +558,7 @@ impl<B, E> Fallback<B, E> {
     {
         match self {
             Fallback::Default(inner) => Fallback::Default(f(inner)),
-            Fallback::Custom(inner) => Fallback::Custom(f(inner)),
+            Fallback::Service(inner) => Fallback::Service(f(inner)),
         }
     }
 }
