@@ -5,17 +5,17 @@ use crate::{
     body::{Body, Bytes, HttpBody},
     error_handling::{HandleError, HandleErrorLayer},
     extract::connect_info::IntoMakeServiceWithConnectInfo,
-    handler::{Handler, IntoServiceStateInExtension},
+    handler::{BoxedHandler, Handler, IntoServiceStateInExtension},
     http::{Method, Request, StatusCode},
     response::Response,
     routing::{future::RouteFuture, Fallback, MethodFilter, Route},
+    util::try_downcast,
 };
 use axum_core::response::IntoResponse;
 use bytes::BytesMut;
 use std::{
     convert::Infallible,
     fmt,
-    marker::PhantomData,
     sync::Arc,
     task::{Context, Poll},
 };
@@ -521,9 +521,8 @@ pub struct MethodRouter<S = (), B = Body, E = Infallible> {
     post: Option<Route<B, E>>,
     put: Option<Route<B, E>>,
     trace: Option<Route<B, E>>,
-    fallback: Fallback<B, E>,
+    fallback: Fallback<S, B, E>,
     allow_header: AllowHeader,
-    _marker: PhantomData<fn() -> S>,
 }
 
 #[derive(Clone)]
@@ -720,7 +719,6 @@ where
             trace: None,
             allow_header: AllowHeader::None,
             fallback: Fallback::Default(fallback),
-            _marker: PhantomData,
         }
     }
 
@@ -741,7 +739,15 @@ where
         }
     }
 
-    pub(crate) fn downcast_state<S2>(self) -> MethodRouter<S2, B, E> {
+    pub(crate) fn downcast_state<S2>(
+        self,
+        state_for_fallback: Option<Arc<S>>,
+    ) -> MethodRouter<S2, B, E>
+    where
+        E: 'static,
+        S: 'static,
+        S2: 'static,
+    {
         MethodRouter {
             get: self.get,
             head: self.head,
@@ -751,9 +757,20 @@ where
             post: self.post,
             put: self.put,
             trace: self.trace,
-            fallback: self.fallback,
+            fallback: match self.fallback {
+                Fallback::Default(route) => Fallback::Default(route),
+                Fallback::Service(route) => Fallback::Service(route),
+                Fallback::BoxedHandler(handler) => match state_for_fallback {
+                    Some(state) => Fallback::Service(handler.into_route(state)),
+                    None => Fallback::BoxedHandler(
+                        try_downcast::<BoxedHandler<S2, B, E>, BoxedHandler<S, B, E>>(handler)
+                            .unwrap_or_else(|_| {
+                                panic!("we should have panicked earlier if state types don't match")
+                            }),
+                    ),
+                },
+            },
             allow_header: self.allow_header,
-            _marker: PhantomData,
         }
     }
 
@@ -823,31 +840,35 @@ where
     }
 
     #[doc = include_str!("../docs/method_routing/layer.md")]
-    pub fn layer<L, NewReqBody, NewError>(self, layer: L) -> MethodRouter<S, NewReqBody, NewError>
+    pub fn layer<L, NewReqBody: 'static, NewError: 'static>(
+        self,
+        layer: L,
+    ) -> MethodRouter<S, NewReqBody, NewError>
     where
-        L: Layer<Route<B, E>>,
+        L: Layer<Route<B, E>> + Clone + Send + 'static,
         L::Service: Service<Request<NewReqBody>, Error = NewError> + Clone + Send + 'static,
         <L::Service as Service<Request<NewReqBody>>>::Response: IntoResponse + 'static,
         <L::Service as Service<Request<NewReqBody>>>::Future: Send + 'static,
+        E: 'static,
+        S: 'static,
     {
-        let layer_fn = |svc| {
+        let layer_fn = move |svc| {
             let svc = layer.layer(svc);
             let svc = MapResponseLayer::new(IntoResponse::into_response).layer(svc);
             Route::new(svc)
         };
 
         MethodRouter {
-            get: self.get.map(layer_fn),
-            head: self.head.map(layer_fn),
-            delete: self.delete.map(layer_fn),
-            options: self.options.map(layer_fn),
-            patch: self.patch.map(layer_fn),
-            post: self.post.map(layer_fn),
-            put: self.put.map(layer_fn),
-            trace: self.trace.map(layer_fn),
+            get: self.get.map(layer_fn.clone()),
+            head: self.head.map(layer_fn.clone()),
+            delete: self.delete.map(layer_fn.clone()),
+            options: self.options.map(layer_fn.clone()),
+            patch: self.patch.map(layer_fn.clone()),
+            post: self.post.map(layer_fn.clone()),
+            put: self.put.map(layer_fn.clone()),
+            trace: self.trace.map(layer_fn.clone()),
             fallback: self.fallback.map(layer_fn),
             allow_header: self.allow_header,
-            _marker: self._marker,
         }
     }
 
@@ -924,15 +945,15 @@ where
         }
 
         #[track_caller]
-        fn merge_fallback<B, E>(
-            fallback: Fallback<B, E>,
-            fallback_other: Fallback<B, E>,
-        ) -> Fallback<B, E> {
+        fn merge_fallback<S, B, E>(
+            fallback: Fallback<S, B, E>,
+            fallback_other: Fallback<S, B, E>,
+        ) -> Fallback<S, B, E> {
             match (fallback, fallback_other) {
                 (pick @ Fallback::Default(_), Fallback::Default(_)) => pick,
-                (Fallback::Default(_), pick @ Fallback::Service(_)) => pick,
-                (pick @ Fallback::Service(_), Fallback::Default(_)) => pick,
-                (Fallback::Service(_), Fallback::Service(_)) => {
+                (Fallback::Default(_), pick) => pick,
+                (pick, Fallback::Default(_)) => pick,
+                _ => {
                     panic!("Cannot merge two `MethodRouter`s that both have a fallback")
                 }
             }
@@ -965,13 +986,14 @@ where
     /// This is a convenience method for doing `self.layer(HandleErrorLayer::new(f))`.
     pub fn handle_error<F, T>(self, f: F) -> MethodRouter<S, B, Infallible>
     where
-        F: Clone + Send + 'static,
+        F: Clone + Send + Sync + 'static,
         HandleError<Route<B, E>, F, T>: Service<Request<B>, Error = Infallible>,
         <HandleError<Route<B, E>, F, T> as Service<Request<B>>>::Future: Send,
         <HandleError<Route<B, E>, F, T> as Service<Request<B>>>::Response: IntoResponse + Send,
         T: 'static,
         E: 'static,
         B: 'static,
+        S: 'static,
     {
         self.layer(HandleErrorLayer::new(f))
     }
@@ -1149,7 +1171,6 @@ impl<S, B, E> Clone for MethodRouter<S, B, E> {
             trace: self.trace.clone(),
             fallback: self.fallback.clone(),
             allow_header: self.allow_header.clone(),
-            _marker: self._marker,
         }
     }
 }
@@ -1224,7 +1245,7 @@ where
 
 impl<S, B, E> Service<Request<B>> for WithState<S, B, E>
 where
-    B: HttpBody,
+    B: HttpBody + Send,
     S: Send + Sync + 'static,
 {
     type Response = Response;
@@ -1270,7 +1291,6 @@ where
                     trace,
                     fallback,
                     allow_header,
-                    _marker: _,
                 },
         } = self;
 
@@ -1291,6 +1311,12 @@ where
                 .strip_body(method == Method::HEAD),
             Fallback::Service(fallback) => RouteFuture::from_future(fallback.oneshot_inner(req))
                 .strip_body(method == Method::HEAD),
+            Fallback::BoxedHandler(fallback) => RouteFuture::from_future(
+                fallback
+                    .clone()
+                    .into_route(Arc::clone(state))
+                    .oneshot_inner(req),
+            ),
         };
 
         match allow_header {

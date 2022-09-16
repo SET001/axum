@@ -4,14 +4,20 @@ use self::not_found::NotFound;
 use crate::{
     body::{Body, HttpBody},
     extract::connect_info::IntoMakeServiceWithConnectInfo,
-    handler::Handler,
+    handler::{BoxedHandler, Handler},
     util::try_downcast,
     Extension,
 };
 use axum_core::response::IntoResponse;
 use http::Request;
 use matchit::MatchError;
-use std::{collections::HashMap, convert::Infallible, fmt, sync::Arc};
+use std::{
+    any::{type_name, TypeId},
+    collections::HashMap,
+    convert::Infallible,
+    fmt,
+    sync::Arc,
+};
 use tower::{util::MapResponseLayer, ServiceBuilder};
 use tower_layer::Layer;
 use tower_service::Service;
@@ -59,16 +65,16 @@ impl RouteId {
 
 /// The router type for composing handlers and services.
 pub struct Router<S = (), B = Body> {
-    state: Arc<S>,
+    state: Option<Arc<S>>,
     routes: HashMap<RouteId, Endpoint<S, B>>,
     node: Arc<Node>,
-    fallback: Fallback<B>,
+    fallback: Fallback<S, B>,
 }
 
 impl<S, B> Clone for Router<S, B> {
     fn clone(&self) -> Self {
         Self {
-            state: Arc::clone(&self.state),
+            state: self.state.clone(),
             routes: self.routes.clone(),
             node: Arc::clone(&self.node),
             fallback: self.fallback.clone(),
@@ -162,7 +168,18 @@ where
     /// [`State`]: crate::extract::State
     pub fn with_state_arc(state: Arc<S>) -> Self {
         Self {
-            state,
+            state: Some(state),
+            routes: Default::default(),
+            node: Default::default(),
+            fallback: Fallback::Default(Route::new(NotFound)),
+        }
+    }
+
+    /// Create a new `Router` that inherits its state from another `Router` that it is merged into
+    /// or nested under.
+    pub fn inherit_state() -> Self {
+        Self {
+            state: None,
             routes: Default::default(),
             node: Default::default(),
             fallback: Fallback::Default(Route::new(NotFound)),
@@ -305,29 +322,64 @@ where
             fallback,
         } = other.into();
 
+        let state = match state {
+            // other has its state set
+            Some(s) => Some(s),
+            // other wants to inherit its state
+            None => match &self.state {
+                // self has state, attempt to inherit
+                Some(s) => match try_downcast::<Arc<S2>, Arc<S>>(Arc::clone(s)) {
+                    Ok(s) => Some(s),
+                    Err(_) => {
+                        panic!(
+                            "can't merge a `Router` that wants to inherit state of type `{}`\
+                             into a `Router` that holds state of type `{}`",
+                            type_name::<S2>(),
+                            type_name::<S>(),
+                        );
+                    }
+                },
+                // both `Router`s inherit the same state type
+                None if TypeId::of::<S>() == TypeId::of::<S2>() => None,
+                None => {
+                    panic!("can't merge two `Router`s that want to inherit different state types");
+                }
+            },
+        };
+
         for (id, route) in routes {
             let path = node
                 .route_id_to_path
                 .get(&id)
                 .expect("no path for route id. This is a bug in axum. Please file an issue");
             self = match route {
-                Endpoint::MethodRouter(method_router) => self.route(
-                    path,
-                    method_router
+                Endpoint::MethodRouter(method_router) => {
+                    let method_router = match &state {
                         // this will set the state for each route
                         // such we don't override the inner state later in `MethodRouterWithState`
-                        .layer(Extension(Arc::clone(&state)))
-                        .downcast_state(),
-                ),
+                        Some(s) => method_router.layer(Extension(Arc::clone(s))),
+                        None => method_router,
+                    };
+                    self.route(path, method_router.downcast_state(state.clone()))
+                }
                 Endpoint::Route(route) => self.route_service(path, route),
             };
         }
 
         self.fallback = match (self.fallback, fallback) {
-            (Fallback::Default(_), pick @ Fallback::Default(_)) => pick,
-            (Fallback::Default(_), pick @ Fallback::Service(_)) => pick,
-            (pick @ Fallback::Service(_), Fallback::Default(_)) => pick,
-            (Fallback::Service(_), Fallback::Service(_)) => {
+            (Fallback::Default(_), Fallback::Default(route)) => Fallback::Default(route),
+            (Fallback::Default(_), Fallback::Service(route)) => Fallback::Service(route),
+            (Fallback::Default(_), Fallback::BoxedHandler(handler)) => match state {
+                Some(state) => Fallback::Service(handler.into_route(state)),
+                None => Fallback::BoxedHandler(
+                    try_downcast::<BoxedHandler<S, B>, BoxedHandler<S2, B>>(handler)
+                        .unwrap_or_else(|_| {
+                            panic!("we should have panicked earlier if state types don't match")
+                        }),
+                ),
+            },
+            (pick, Fallback::Default(_)) => pick,
+            _ => {
                 panic!("Cannot merge two `Router`s that both have a fallback")
             }
         };
@@ -336,9 +388,9 @@ where
     }
 
     #[doc = include_str!("../docs/routing/layer.md")]
-    pub fn layer<L, NewReqBody>(self, layer: L) -> Router<S, NewReqBody>
+    pub fn layer<L, NewReqBody: 'static>(self, layer: L) -> Router<S, NewReqBody>
     where
-        L: Layer<Route<B>>,
+        L: Layer<Route<B>> + Clone + Send + 'static,
         L::Service: Service<Request<NewReqBody>> + Clone + Send + 'static,
         <L::Service as Service<Request<NewReqBody>>>::Response: IntoResponse + 'static,
         <L::Service as Service<Request<NewReqBody>>>::Error: Into<Infallible> + 'static,
@@ -356,7 +408,7 @@ where
             .map(|(id, route)| {
                 let route = match route {
                     Endpoint::MethodRouter(method_router) => {
-                        Endpoint::MethodRouter(method_router.layer(&layer))
+                        Endpoint::MethodRouter(method_router.layer(layer.clone()))
                     }
                     Endpoint::Route(route) => Endpoint::Route(Route::new(layer.layer(route))),
                 };
@@ -364,7 +416,7 @@ where
             })
             .collect();
 
-        let fallback = self.fallback.map(|svc| Route::new(layer.layer(svc)));
+        let fallback = self.fallback.map(move |svc| Route::new(layer.layer(svc)));
 
         Router {
             state: self.state,
@@ -378,7 +430,7 @@ where
     #[track_caller]
     pub fn route_layer<L>(self, layer: L) -> Self
     where
-        L: Layer<Route<B>>,
+        L: Layer<Route<B>> + Clone + Send + 'static,
         L::Service: Service<Request<B>> + Clone + Send + 'static,
         <L::Service as Service<Request<B>>>::Response: IntoResponse + 'static,
         <L::Service as Service<Request<B>>>::Error: Into<Infallible> + 'static,
@@ -403,7 +455,7 @@ where
             .map(|(id, route)| {
                 let route = match route {
                     Endpoint::MethodRouter(method_router) => {
-                        Endpoint::MethodRouter(method_router.layer(&layer))
+                        Endpoint::MethodRouter(method_router.layer(layer.clone()))
                     }
                     Endpoint::Route(route) => Endpoint::Route(Route::new(layer.layer(route))),
                 };
@@ -420,13 +472,13 @@ where
     }
 
     #[doc = include_str!("../docs/routing/fallback.md")]
-    pub fn fallback<H, T>(self, handler: H) -> Self
+    pub fn fallback<H, T>(mut self, handler: H) -> Self
     where
         H: Handler<T, S, B>,
         T: 'static,
     {
-        let state = Arc::clone(&self.state);
-        self.fallback_service(handler.with_state_arc(state))
+        self.fallback = Fallback::BoxedHandler(BoxedHandler::new(handler));
+        self
     }
 
     /// Add a fallback [`Service`] to the router.
@@ -480,11 +532,6 @@ where
     ) -> IntoMakeServiceWithConnectInfo<RouterService<B>, C> {
         IntoMakeServiceWithConnectInfo::new(self.into_service())
     }
-
-    /// Get a reference to the state.
-    pub fn state(&self) -> &S {
-        &self.state
-    }
 }
 
 /// Wrapper around `matchit::Router` that supports merging two `Router`s.
@@ -528,37 +575,46 @@ impl fmt::Debug for Node {
     }
 }
 
-enum Fallback<B, E = Infallible> {
+enum Fallback<S, B, E = Infallible> {
     Default(Route<B, E>),
     Service(Route<B, E>),
+    BoxedHandler(BoxedHandler<S, B, E>),
 }
 
-impl<B, E> Clone for Fallback<B, E> {
+impl<S, B, E> Clone for Fallback<S, B, E> {
     fn clone(&self) -> Self {
         match self {
             Fallback::Default(inner) => Fallback::Default(inner.clone()),
             Fallback::Service(inner) => Fallback::Service(inner.clone()),
+            Fallback::BoxedHandler(inner) => Fallback::BoxedHandler(inner.clone()),
         }
     }
 }
 
-impl<B, E> fmt::Debug for Fallback<B, E> {
+impl<S, B, E> fmt::Debug for Fallback<S, B, E> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Default(inner) => f.debug_tuple("Default").field(inner).finish(),
             Self::Service(inner) => f.debug_tuple("Service").field(inner).finish(),
+            Self::BoxedHandler(_) => f.debug_tuple("BoxedHandler").finish(),
         }
     }
 }
 
-impl<B, E> Fallback<B, E> {
-    fn map<F, B2, E2>(self, f: F) -> Fallback<B2, E2>
+impl<S, B, E> Fallback<S, B, E> {
+    fn map<F, B2, E2>(self, f: F) -> Fallback<S, B2, E2>
     where
-        F: FnOnce(Route<B, E>) -> Route<B2, E2>,
+        S: 'static,
+        B: 'static,
+        E: 'static,
+        F: FnOnce(Route<B, E>) -> Route<B2, E2> + Clone + Send + 'static,
+        B2: 'static,
+        E2: 'static,
     {
         match self {
             Fallback::Default(inner) => Fallback::Default(f(inner)),
             Fallback::Service(inner) => Fallback::Service(f(inner)),
+            Fallback::BoxedHandler(inner) => Fallback::BoxedHandler(inner.map(f)),
         }
     }
 }
