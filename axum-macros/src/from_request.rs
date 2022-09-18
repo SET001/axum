@@ -6,7 +6,7 @@ use crate::{
 use proc_macro2::{Span, TokenStream};
 use quote::{quote, quote_spanned, ToTokens};
 use std::{fmt, iter};
-use syn::{parse_quote, punctuated::Punctuated, spanned::Spanned, Ident, Path, Token};
+use syn::{parse_quote, punctuated::Punctuated, spanned::Spanned, Fields, Ident, Token, Type};
 
 mod attr;
 
@@ -17,7 +17,7 @@ pub(crate) enum Trait {
 }
 
 impl Trait {
-    fn body_impl_generics(&self) -> impl Iterator<Item = Path> {
+    fn body_impl_generics(&self) -> impl Iterator<Item = Type> {
         match self {
             Trait::FromRequest => Some(parse_quote!(B)).into_iter(),
             Trait::FromRequestParts => None.into_iter(),
@@ -35,23 +35,21 @@ impl fmt::Display for Trait {
 }
 
 enum State {
-    Custom(syn::Path),
-    Default(syn::Path),
+    Custom(syn::Type),
+    Default(syn::Type),
 }
 
 impl State {
-    fn impl_generics(&self) -> impl Iterator<Item = Path> {
+    fn impl_generics(&self) -> impl Iterator<Item = Type> {
         match self {
-            // TODO(david): do we actually need these clones?
             State::Default(inner) => Some(inner.clone()),
             State::Custom(_) => None,
         }
         .into_iter()
     }
 
-    fn ty_generics(&self) -> impl Iterator<Item = Path> {
+    fn ty_generics(&self) -> impl Iterator<Item = Type> {
         match self {
-            // TODO(david): do we actually need these clones?
             State::Default(inner) => iter::once(inner.clone()),
             State::Custom(inner) => iter::once(inner.clone()),
         }
@@ -99,7 +97,9 @@ pub(crate) fn expand(item: syn::Item, tr: Trait) -> syn::Result<TokenStream> {
 
             let state = match state {
                 Some((_, state)) => State::Custom(state),
-                None => State::Default(syn::parse_quote!(S)),
+                None => state_type_from_fields(&fields)
+                    .map(State::Custom)
+                    .unwrap_or_else(|| State::Default(syn::parse_quote!(S))),
             };
 
             match (via.map(second), rejection.map(second)) {
@@ -144,7 +144,8 @@ pub(crate) fn expand(item: syn::Item, tr: Trait) -> syn::Result<TokenStream> {
             let FromRequestContainerAttrs {
                 via,
                 rejection,
-                state,
+                // TODO(david): use state
+                state: _,
             } = parse_attrs("from_request", &attrs)?;
 
             match (via.map(second), rejection) {
@@ -293,12 +294,12 @@ fn impl_struct_by_extracting_each_field(
     let impl_generics = tr
         .body_impl_generics()
         .chain(state.impl_generics())
-        .collect::<Punctuated<Path, Token![,]>>();
+        .collect::<Punctuated<Type, Token![,]>>();
 
     let ty_generics = state
         .ty_generics()
         .chain(tr.body_impl_generics())
-        .collect::<Punctuated<Path, Token![,]>>();
+        .collect::<Punctuated<Type, Token![,]>>();
 
     let state_bounds = state.bounds();
 
@@ -869,6 +870,17 @@ fn impl_enum_by_extracting_all_at_once(
     };
 
     Ok(tokens)
+}
+
+fn state_type_from_fields(fields: &Fields) -> Option<Type> {
+    let types: Box<dyn Iterator<Item = &Type>> = match fields {
+        Fields::Named(fields_named) => Box::new(fields_named.named.iter().map(|field| &field.ty)),
+        Fields::Unnamed(fields_unnamed) => {
+            Box::new(fields_unnamed.unnamed.iter().map(|field| &field.ty))
+        }
+        Fields::Unit => Box::new(iter::empty()),
+    };
+    crate::infer_state_type(types)
 }
 
 #[test]

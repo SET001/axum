@@ -14,7 +14,7 @@ pub(crate) mod kw {
 pub(super) struct FromRequestContainerAttrs {
     pub(super) via: Option<(kw::via, syn::Path)>,
     pub(super) rejection: Option<(kw::rejection, syn::Path)>,
-    pub(super) state: Option<(kw::state, syn::Path)>,
+    pub(super) state: Option<(kw::state, syn::Type)>,
 }
 
 impl Parse for FromRequestContainerAttrs {

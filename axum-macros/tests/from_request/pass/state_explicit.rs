@@ -4,19 +4,30 @@ use axum::extract::{FromRef, State};
 #[derive(FromRequest)]
 #[from_request(state(AppState))]
 struct Extractor {
-    inner_state: State<InnerState>,
+    one: State<One>,
+    two: State<Two>,
 }
 
 struct AppState {
-    inner: InnerState,
+    one: One,
+    two: Two,
 }
 
 #[derive(Clone)]
-struct InnerState {}
+struct One {}
 
-impl FromRef<AppState> for InnerState {
+impl FromRef<AppState> for One {
     fn from_ref(input: &AppState) -> Self {
-        input.inner.clone()
+        input.one.clone()
+    }
+}
+
+#[derive(Clone)]
+struct Two {}
+
+impl FromRef<AppState> for Two {
+    fn from_ref(input: &AppState) -> Self {
+        input.two.clone()
     }
 }
 
