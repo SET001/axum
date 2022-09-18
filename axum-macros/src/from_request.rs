@@ -144,8 +144,7 @@ pub(crate) fn expand(item: syn::Item, tr: Trait) -> syn::Result<TokenStream> {
             let FromRequestContainerAttrs {
                 via,
                 rejection,
-                // TODO(david): use state
-                state: _,
+                state,
             } = parse_attrs("from_request", &attrs)?;
 
             match (via.map(second), rejection) {
