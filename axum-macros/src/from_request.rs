@@ -4,9 +4,9 @@ use crate::{
     from_request::attr::FromRequestFieldAttrs,
 };
 use proc_macro2::{Span, TokenStream};
-use quote::{quote, quote_spanned};
-use std::fmt;
-use syn::{punctuated::Punctuated, spanned::Spanned, Ident, Token};
+use quote::{quote, quote_spanned, ToTokens};
+use std::{fmt, iter};
+use syn::{parse_quote, punctuated::Punctuated, spanned::Spanned, Ident, Path, Token};
 
 mod attr;
 
@@ -16,11 +16,62 @@ pub(crate) enum Trait {
     FromRequestParts,
 }
 
+impl Trait {
+    fn body_impl_generics(&self) -> impl Iterator<Item = Path> {
+        match self {
+            Trait::FromRequest => Some(parse_quote!(B)).into_iter(),
+            Trait::FromRequestParts => None.into_iter(),
+        }
+    }
+}
+
 impl fmt::Display for Trait {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Trait::FromRequest => f.write_str("FromRequest"),
             Trait::FromRequestParts => f.write_str("FromRequestParts"),
+        }
+    }
+}
+
+enum State {
+    Custom(syn::Path),
+    Default(syn::Path),
+}
+
+impl State {
+    fn impl_generics(&self) -> impl Iterator<Item = Path> {
+        match self {
+            // TODO(david): do we actually need these clones?
+            State::Default(inner) => Some(inner.clone()),
+            State::Custom(_) => None,
+        }
+        .into_iter()
+    }
+
+    fn ty_generics(&self) -> impl Iterator<Item = Path> {
+        match self {
+            // TODO(david): do we actually need these clones?
+            State::Default(inner) => iter::once(inner.clone()),
+            State::Custom(inner) => iter::once(inner.clone()),
+        }
+    }
+
+    fn bounds(&self) -> TokenStream {
+        match self {
+            State::Custom(_) => quote! {},
+            State::Default(inner) => quote! {
+                #inner: ::std::marker::Send + ::std::marker::Sync,
+            },
+        }
+    }
+}
+
+impl ToTokens for State {
+    fn to_tokens(&self, tokens: &mut TokenStream) {
+        match self {
+            State::Custom(inner) => inner.to_tokens(tokens),
+            State::Default(inner) => inner.to_tokens(tokens),
         }
     }
 }
@@ -40,20 +91,32 @@ pub(crate) fn expand(item: syn::Item, tr: Trait) -> syn::Result<TokenStream> {
 
             let generic_ident = parse_single_generic_type_on_struct(generics, &fields, tr)?;
 
-            let FromRequestContainerAttrs { via, rejection } = parse_attrs("from_request", &attrs)?;
+            let FromRequestContainerAttrs {
+                via,
+                rejection,
+                state,
+            } = parse_attrs("from_request", &attrs)?;
+
+            let state = match state {
+                Some((_, state)) => State::Custom(state),
+                None => State::Default(syn::parse_quote!(S)),
+            };
 
             match (via.map(second), rejection.map(second)) {
-                (Some(via), rejection) => impl_struct_by_extracting_all_at_once(
-                    ident,
-                    fields,
-                    via,
-                    rejection,
-                    generic_ident,
-                    tr,
-                ),
+                (Some(via), rejection) => {
+                    // TODO(david): use `state`
+                    impl_struct_by_extracting_all_at_once(
+                        ident,
+                        fields,
+                        via,
+                        rejection,
+                        generic_ident,
+                        tr,
+                    )
+                }
                 (None, rejection) => {
                     error_on_generic_ident(generic_ident, tr)?;
-                    impl_struct_by_extracting_each_field(ident, fields, rejection, tr)
+                    impl_struct_by_extracting_each_field(ident, fields, rejection, state, tr)
                 }
             }
         }
@@ -78,7 +141,11 @@ pub(crate) fn expand(item: syn::Item, tr: Trait) -> syn::Result<TokenStream> {
                 return Err(syn::Error::new_spanned(where_clause, generics_error));
             }
 
-            let FromRequestContainerAttrs { via, rejection } = parse_attrs("from_request", &attrs)?;
+            let FromRequestContainerAttrs {
+                via,
+                rejection,
+                state,
+            } = parse_attrs("from_request", &attrs)?;
 
             match (via.map(second), rejection) {
                 (Some(via), rejection) => impl_enum_by_extracting_all_at_once(
@@ -210,6 +277,7 @@ fn impl_struct_by_extracting_each_field(
     ident: syn::Ident,
     fields: syn::Fields,
     rejection: Option<syn::Path>,
+    state: State,
     tr: Trait,
 ) -> syn::Result<TokenStream> {
     let extract_fields = extract_fields(&fields, &rejection, tr)?;
@@ -222,22 +290,34 @@ fn impl_struct_by_extracting_each_field(
         quote!(::axum::response::Response)
     };
 
+    let impl_generics = tr
+        .body_impl_generics()
+        .chain(state.impl_generics())
+        .collect::<Punctuated<Path, Token![,]>>();
+
+    let ty_generics = state
+        .ty_generics()
+        .chain(tr.body_impl_generics())
+        .collect::<Punctuated<Path, Token![,]>>();
+
+    let state_bounds = state.bounds();
+
     Ok(match tr {
         Trait::FromRequest => quote! {
             #[::axum::async_trait]
             #[automatically_derived]
-            impl<S, B> ::axum::extract::FromRequest<S, B> for #ident
+            impl<#impl_generics> ::axum::extract::FromRequest<#ty_generics> for #ident
             where
                 B: ::axum::body::HttpBody + ::std::marker::Send + 'static,
                 B::Data: ::std::marker::Send,
                 B::Error: ::std::convert::Into<::axum::BoxError>,
-                S: ::std::marker::Send + ::std::marker::Sync,
+                #state_bounds
             {
                 type Rejection = #rejection_ident;
 
                 async fn from_request(
                     mut req: ::axum::http::Request<B>,
-                    state: &S,
+                    state: &#state,
                 ) -> ::std::result::Result<Self, Self::Rejection> {
                     ::std::result::Result::Ok(Self {
                         #(#extract_fields)*
@@ -248,15 +328,15 @@ fn impl_struct_by_extracting_each_field(
         Trait::FromRequestParts => quote! {
             #[::axum::async_trait]
             #[automatically_derived]
-            impl<S> ::axum::extract::FromRequestParts<S> for #ident
+            impl<#impl_generics> ::axum::extract::FromRequestParts<#ty_generics> for #ident
             where
-                S: ::std::marker::Send + ::std::marker::Sync,
+                #state_bounds
             {
                 type Rejection = #rejection_ident;
 
                 async fn from_request_parts(
                     parts: &mut ::axum::http::request::Parts,
-                    state: &S,
+                    state: &#state,
                 ) -> ::std::result::Result<Self, Self::Rejection> {
                     ::std::result::Result::Ok(Self {
                         #(#extract_fields)*
